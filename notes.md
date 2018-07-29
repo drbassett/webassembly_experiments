@@ -90,7 +90,7 @@ static void resizeCanvas() {
 
 static void mainLoop(void* arg) {
 	resizeCanvas();
-	
+
 	// ...
 }
 
@@ -109,3 +109,37 @@ Shortly after working through the resizing problems detailed above, I
 discovered `emscripten_enter_soft_fullscreen`. This seems to be a clean
 solution to the canvas resizing problem. Under the hood, this function likely
 has some of the same problems I encountered, but perhaps not.
+
+## Animation Loop
+
+Emscripten recommendeds doing an animation loop as follows:
+
+```c
+f64 lastTimeMilliseconds;
+
+static void mainLoop(void* arg) {
+	f64 timeMilliseconds = emscripten_get_now();
+	f32 dtMilliseconds = (f32) (timeMilliseconds - lastTimeMilliseconds);
+	lastTimeMilliseconds = timeMilliseconds;
+
+	// update using dtMilliseconds
+}
+
+int main() {
+	lastTimeMilliseconds = emscripten_get_now();
+	emscripten_set_main_loop_arg(mainLoop, NULL, 0, EM_TRUE);
+	return 0;
+}
+```
+
+However, this does loop not produce a very stable frame rate. On both Firefox
+and Chrome, `dtMilliseconds` jumps between 16.0 and 17.0, and sometimes slips
+into periods of alternating between 33.0 and 34.0. Occasionally, it will also
+be 18.0, 20.0, or some other randoms number. The really odd thing is that frame
+times are always a whole number. I have written native code that achieves frame
+times of precisely 16.666... milliseconds on both Windows and Linux, throughout
+the lifetime of an application, so this is theoretically possible. Why can't
+the browser do this?
+
+Is there another way of doing things so that I can get fractional frame times,
+and have a more stable frame rate?
