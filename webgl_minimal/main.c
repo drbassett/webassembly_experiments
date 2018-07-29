@@ -61,9 +61,18 @@ int main() {
 		FatalError("Failed to create WebGL context: %s (%d)\n", emscriptenResultToString(result), result);
 	}
 	emscripten_webgl_make_context_current(context);
+
+	EmscriptenFullscreenStrategy fullscreenStrategy = {
+		.scaleMode = EMSCRIPTEN_FULLSCREEN_SCALE_STRETCH,
+		.canvasResolutionScaleMode = EMSCRIPTEN_FULLSCREEN_CANVAS_SCALE_STDDEF,
+		.filteringMode = EMSCRIPTEN_FULLSCREEN_FILTERING_NEAREST,
+		.canvasResizedCallback = NULL,
+		.canvasResizedCallbackUserData = NULL,
+	};
+	emscripten_enter_soft_fullscreen(canvasId, &fullscreenStrategy);
+
 	glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
 	glClear(GL_COLOR_BUFFER_BIT);
-	glFinish();
 	EmscriptenCheckResult(emscripten_webgl_destroy_context(context));
 	return 0;
 }
