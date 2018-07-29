@@ -19,7 +19,7 @@ set outDir=%rootDir%\out
 set emccDebugFlags=-O0 -g --emrun
 set emccReleaseFlags=-O3
 set emccConfigFlags=%emccDebugFlags%
-set emccFlags=-fno-exceptions -fno-rtti %emccConfigFlags%
+set emccFlags=-fno-exceptions -fno-rtti -I%rootDir% %emccConfigFlags%
 
 if not exist %outDir% (mkdir %outDir%)
 pushd %rootDir%/%projectDir%
