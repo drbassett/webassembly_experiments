@@ -102,3 +102,10 @@ int main() {
 	return 0;
 }
 ```
+
+### Soft Fullscreen
+
+Shortly after working through the resizing problems detailed above, I
+discovered `emscripten_enter_soft_fullscreen`. This seems to be a clean
+solution to the canvas resizing problem. Under the hood, this function likely
+has some of the same problems I encountered, but perhaps not.

@@ -103,25 +103,16 @@ GLuint program;
 // the ID of the canvas element on the HTML page
 const char* canvasId = "canvas";
 
-static void resizeCanvas() {
-	EM_ASM({
-		var canvas = document.getElementById('canvas');
-		var displayWidth = canvas.clientWidth;
-		var displayHeight = canvas.clientHeight;
-		if (canvas.width != displayWidth || canvas.height != displayHeight) {
-			canvas.width = displayWidth;
-			canvas.height = displayHeight;
-		}
-	});
+static EM_BOOL canvasResizedCallback(int eventType, const void* reserved, void* userData) {
 	double width, height;
 	EmscriptenCheckResult(emscripten_get_element_css_size(canvasId, &width, &height));
 	i32 canvasWidth = (i32) width;
 	i32 canvasHeight = (i32) height;
 	glViewport(0, 0, canvasWidth, canvasHeight);
+	return EM_TRUE;
 }
 
 static void mainLoop(void* arg) {
-	resizeCanvas();
 	glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
 	glClear(GL_COLOR_BUFFER_BIT);
 	glUseProgram(program);
@@ -195,6 +186,15 @@ int main() {
 
 	glDeleteShader(vertShader);
 	glDeleteShader(fragShader);
+
+	EmscriptenFullscreenStrategy fullscreenStrategy = {
+		.scaleMode = EMSCRIPTEN_FULLSCREEN_SCALE_STRETCH,
+		.canvasResolutionScaleMode = EMSCRIPTEN_FULLSCREEN_CANVAS_SCALE_STDDEF,
+		.filteringMode = EMSCRIPTEN_FULLSCREEN_FILTERING_NEAREST,
+		.canvasResizedCallback = canvasResizedCallback,
+		.canvasResizedCallbackUserData = NULL,
+	};
+	emscripten_enter_soft_fullscreen(canvasId, &fullscreenStrategy);
 
 	emscripten_set_main_loop_arg(mainLoop, NULL, 0, EM_TRUE);
 
