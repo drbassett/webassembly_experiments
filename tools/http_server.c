@@ -66,6 +66,7 @@ inline static StringSlice stringSliceFromCString(const char* cs) {
 	return ss;
 }
 
+//TODO rename to stringSliceCount
 inline static uword stringSliceLength(StringSlice ss) {
 	return (uword) (ss.end - ss.begin);
 }
@@ -177,73 +178,6 @@ const char* context, SOCKET socket, uword bufferCapacity, u8* buffer, uword* str
 	}
 }
 
-static DWORD WINAPI runClient(void* param) {
-	int wsResult;
-
-	addrinfo addrHints = {
-		.ai_family = AF_UNSPEC,
-		.ai_socktype = SOCK_STREAM,
-		.ai_protocol = IPPROTO_TCP,
-	};
-	addrinfo* addr; //LEAK
-	wsResult = getaddrinfo(serverAddress, port, &addrHints, &addr);
-	if (wsResult != 0) {
-		fprintf(stderr, "[Client] getaddrinfo() failed: %d\n", wsResult);
-		return 1;
-	}
-
-	SOCKET sock = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
-	if (sock == INVALID_SOCKET) {
-		fprintf(stderr, "[Client] socket() failed: %d\n", WSAGetLastError());
-		return 1;
-	}
-
-	printf("[Client] Establishing connection to server...\n");
-
-	wsResult = connect(sock, addr->ai_addr, (int) addr->ai_addrlen);
-	if (wsResult == SOCKET_ERROR) {
-		fprintf(stderr, "[Client] connect() failed: %d\n", wsResult);
-		return 1;
-	}
-	freeaddrinfo(addr);
-	addr = NULL;
-
-	printf("[Client] Connected to server.\n");
-
-	const char* httpRequest =
-		"GET /index.html\r\n"
-		"Accept: text/html\r\n"
-		"Accept-Charset: utf-8\r\n"
-		"Accept-Encoding: gzip, deflate\r\n"
-		"\r\n";
-	uword stringLength = strlen(httpRequest);
-	if (!socketSend("Client", sock, stringLength, (char*) httpRequest)) {
-		return 1;
-	}
-	printf("[Client] Sent GET request to server.\n");
-
-	char* receivedChars[1024];
-	uword maxCharCount = ArrayCount(receivedChars);
-
-	uword bytesReceived = 0;
-	if (!socketReceive("Client", sock, maxCharCount, receivedChars, &bytesReceived)) {
-		return 1;
-	}
-	printf("[Client] Received reponse from server.\n");
-
-//TODO print response from server
-
-	if (shutdown(sock, SD_SEND) == SOCKET_ERROR) {
-		fprintf(stderr, "[Client] shutdown() failed: %d\n", WSAGetLastError());
-		return 1;
-	}
-
-	closesocket(sock);
-
-	printf("[Client] Done.\n");
-	return 0;
-}
-
 inline static void skipSpaces(const char** cursor, const char* end) {
 	for (;;) {
 		if (*cursor == end || **cursor != ' ') {
@@ -251,6 +185,62 @@ inline static void skipSpaces(const char** cursor, const char* end) {
 		}
 		*cursor += 1;
 	}
+}
+
+typedef struct HttpHeader {
+	uword charCount;
+	const char* chars;
+	const char* cursor;
+} HttpHeader;
+
+typedef struct HttpOption {
+	StringSlice key;
+	StringSlice value;
+} HttpOption;
+
+// Read the next line from a buffered HTTP header. If this line is the end of
+// the header (a blank line), this function returns false. Otherwise, it
+// returns true.
+static StringSlice httpHeaderNextLine(HttpHeader* header) {
+	const char* lineBegin = header->cursor;
+	const char* headerEnd = header->chars + header->charCount;
+	for (;;) {
+		uword remainingByteCount = headerEnd - header->cursor;
+		assert(remainingByteCount >= 2); // if this is false, we have not been given a valid HTTP header
+		if ((header->cursor[0] == '\r') & (header->cursor[1] == '\n')) {
+			StringSlice line = stringSlice(lineBegin, header->cursor);
+			header->cursor += 2; // advance to the start of the next line
+			return line;
+		}
+		++header->cursor;
+	}
+}
+
+static HttpOption httpHeaderNextOption(HttpHeader* header) {
+	StringSlice line = httpHeaderNextLine(header);
+	uword lineLength = stringSliceLength(line);
+
+	HttpOption option;
+	const char* lineCursor = line.begin;
+	for (;;) {
+		// No colon on this line. Set the key to the entire line; the value
+		// will end up being nothing. This also handles the blank line at the
+		// end of the header, without a special case.
+		if (lineCursor == line.end) {
+			option.key = line;
+			break;
+		}
+		char c = *lineCursor;
+		++lineCursor;
+		if (c == ':') {
+			option.key = stringSlice(line.begin, lineCursor - 1);
+			break;
+		}
+	}
+	skipSpaces(&lineCursor, line.end);
+	option.value = stringSlice(lineCursor, line.end);
+	option.value.end = line.end;
+	return option;
 }
 
 typedef struct HttpBuffer {
@@ -296,20 +286,31 @@ static void httpBufferDiscardBytes(HttpBuffer* buffer, uword byteCount) {
 	buffer->size = newSize;
 }
 
-static b32 httpReadLine(HttpBuffer* buffer, uword* cursor, uword* endOfLine) {
+//TODO in case of malicious/malformed packets, add a maxByteCount parameter; if
+// we do not find the end of the header before reaching this limit, log an
+// error message, send an error response to the client, and close the
+// connection to the client.
+static b32 httpBufferReadHeader(HttpBuffer* buffer, HttpHeader* header) {
+	uword cursor = 0;
 	for (;;) {
-		while (*cursor < buffer->size) {
-			if (buffer->size - *cursor < 2) {
+		while (cursor < buffer->size) {
+			uword remainingByteCount = buffer->size - cursor;
+			if (remainingByteCount < 4) {
 				break;
 			}
-			char thisChar = buffer->data[*cursor];
-			char nextChar = buffer->data[*cursor + 1];
-			if ((thisChar == '\r') & (nextChar == '\n')) {
-				*endOfLine = *cursor;
-				*cursor += 2;
+			b32 blankLine =
+				(buffer->data[cursor + 0] == '\r') &
+				(buffer->data[cursor + 1] == '\n') &
+				(buffer->data[cursor + 2] == '\r') &
+				(buffer->data[cursor + 3] == '\n');
+			if (blankLine) {
+				cursor += 4;
+				header->charCount = cursor;
+				header->chars = buffer->data;
+				header->cursor = buffer->data;
 				return TRUE;
 			}
-			*cursor += 1;
+			++cursor;
 		}
 		if (!httpBufferReadBytes(buffer)) {
 			return FALSE;
@@ -317,43 +318,32 @@ static b32 httpReadLine(HttpBuffer* buffer, uword* cursor, uword* endOfLine) {
 	}
 }
 
-typedef struct HttpOption {
-	StringSlice key;
-	StringSlice value;
-} HttpOption;
+static b32 httpSendOkResponse(const char* context, SOCKET socket, uword contentLength, const void* content) {
+	char header[1024]; //TODO prune the size of this header
+	int headerLength = sprintf(
+		header,
+		"HTTP/1.1 200 OK\r\n"
+		"Connection: close\r\n"
+		"Content-Length: %llu\r\n"
+		"Content-Type: text/html\r\n"
+		"\r\n",
+		(unsigned long long) contentLength);
+	return
+		socketSend(context, socket, headerLength, header) &&
+		socketSend(context, socket, contentLength, content);
+}
 
-static b32 httpReadOption(HttpBuffer* buffer, uword* cursor, HttpOption* option) {
-	uword lineBeginOffset = *cursor;
-	uword lineEndOffset = *cursor;
-	if (!httpReadLine(buffer, cursor, &lineEndOffset)) {
-		return FALSE;
-	}
-	StringSlice line = {
-		buffer->data + lineBeginOffset, buffer->data + lineEndOffset};
-	uword lineLength = lineEndOffset - lineBeginOffset;
-
-	const char* lineCursor = line.begin;
-	for (;;) {
-		// did not find a colon - assume the key is the entire line, and the
-		// value is empty. This also handles the blank line marking the end of
-		// the HTTP header.
-		if (lineCursor == line.end) {
-			option->key = line;
-			option->value.begin = NULL;
-			option->value.end = NULL;
-			return TRUE;
-		}
-		char c = *lineCursor;
-		++lineCursor;
-		if (c == ':') {
-			option->key = stringSlice(line.begin, lineCursor - 1);
-			break;
-		}
-	}
-	skipSpaces(&lineCursor, line.end);
-	option->value.begin = lineCursor;
-	option->value.end = line.end;
-	return TRUE;
+static b32 httpSend404Response(const char* context, SOCKET socket) {
+	const char* response =
+		"HTTP/1.1 404 NOT FOUND\r\n"
+		"Connection: close\r\n"
+		"Content-Length: 14\r\n"
+		"Content-Type: text/plain\r\n"
+		"\r\n"
+		"404 NOT FOUND\n";
+//TODO this string length could be precomputed
+	uword responseLength = strlen(response);
+	return socketSend(context, socket, responseLength, response);
 }
 
 static int runServer() {
@@ -408,102 +398,70 @@ static int runServer() {
 
 //TODO browsers do not tell us to shut down the connection, so we get stuck in this loop
 	for (;;) {
-
-//TODO buffer until the end of the request prior to doing any parsing - this will simplify things
-
-		uword cursor = 0;
-
-		uword requestLineBegin = cursor;
-		uword requestLineEnd = cursor;
-		if (!httpReadLine(&buffer, &cursor, &requestLineEnd)) {
+		HttpHeader header;
+		if (!httpBufferReadHeader(&buffer, &header)) {
 			return 1;
 		}
-		uword requestLineLength = requestLineEnd - requestLineBegin;
+		StringSlice requestLine = httpHeaderNextLine(&header);
+		uword requestLineLength = stringSliceLength(requestLine);
 
-		const char* lineCursor = buffer.data + requestLineBegin;
-		const char* lineEnd = lineCursor + requestLineLength;
-		uword lineLength = requestLineLength;
-		if (lineLength >= 3 && (
-				((lineCursor[0] == 'g') | (lineCursor[0] == 'G')) &
-				((lineCursor[1] == 'e') | (lineCursor[1] == 'E')) &
-				((lineCursor[2] == 't') | (lineCursor[2] == 'T')))) {
-			lineCursor += 3;
-			skipSpaces(&lineCursor, lineEnd);
-			uword urlBeginOffset = (uword) (lineCursor - buffer.data);
+		const char* requestLineCursor = requestLine.begin;
+		b32 getRequest = requestLineLength >= 3 && (
+			((requestLineCursor[0] == 'g') | (requestLineCursor[0] == 'G')) &
+			((requestLineCursor[1] == 'e') | (requestLineCursor[1] == 'E')) &
+			((requestLineCursor[2] == 't') | (requestLineCursor[2] == 'T')));
+		if (getRequest) {
+			requestLineCursor += 3;
+			skipSpaces(&requestLineCursor, requestLine.end);
+			const char* urlBegin = requestLineCursor;
 			for (;;) {
-				if (lineCursor == lineEnd || *lineCursor == ' ') {
+				if (requestLineCursor == requestLine.end || *requestLineCursor == ' ') {
 					break;
 				}
-				++lineCursor;
+				++requestLineCursor;
 			}
-			uword urlEndOffset = (uword) (lineCursor - buffer.data);
+			const char* urlEnd = requestLineCursor;
+			StringSlice url = stringSlice(urlBegin, urlEnd);
 			printf(
 				"[Server] Received GET request: '%.*s'\n",
-				StringSlicePrintf(stringSlice(buffer.data + urlBeginOffset, buffer.data + urlEndOffset)));
-
-			// pointers are invalidated upon reading more data from the HTTP buffer
-			lineCursor = NULL;
-			lineEnd = NULL;
+				StringSlicePrintf(url));
 
 			// read through the rest of the HTTP options
 			for (;;) {
-				HttpOption option;
-				if (!httpReadOption(&buffer, &cursor, &option)) {
-					return 1;
-				}
-				// check for blank option - this marks the end of the HTTP header
+				HttpOption option = httpHeaderNextOption(&header);
+				// check for blank key - this marks the end of the HTTP header
 				if (stringSliceEmpty(option.key)) {
 					break;
 				}
-				uword valueLength = stringSliceLength(option.value);
 				printf("    %.*s: %.*s\n", StringSlicePrintf(option.key), StringSlicePrintf(option.value));
 			}
 
-//TODO log entire GET request header
-
-			StringSlice url = {buffer.data + urlBeginOffset, buffer.data + urlEndOffset};
-			if (stringSliceEmpty(url) ||
-					stringSliceEqualsCString(&url, "/") ||
-					stringSliceEqualsCString(&url, "/index.html")) {
-				printf("[Server] Sending index.html to client\n");
-				const char* body = index_html;
-				uword bodyLength = strlen(index_html);
-				char header[1024];
-				int headerLength = sprintf(
-					header,
-					"HTTP/1.1 200 OK\r\n"
-					"Connection: close\r\n"
-					"Content-Length: %llu\r\n"
-					"Content-Type: text/html\r\n"
-					"\r\n",
-					(unsigned long long) bodyLength);
-				socketSend("Server", clientSocket, headerLength, header);
-				socketSend("Server", clientSocket, bodyLength, body);
+			b32 indexFileRequested =
+				stringSliceEmpty(url) ||
+				stringSliceEqualsCString(&url, "/") ||
+				stringSliceEqualsCString(&url, "/index.html");
+			if (indexFileRequested) {
+				printf("[Server] Sending index.html to client...\n");
+				if (!httpSendOkResponse("SERVER", clientSocket, strlen(index_html), index_html)) {
+					return 1;
+				}
 			} else {
 				printf(
-					"[Server] Sending 404 response for request 'GET %.*s'\n",
+					"[Server] Sending 404 response for request 'GET %.*s'...\n",
 					StringSlicePrintf(url));
-				const char* response =
-					"HTTP/1.1 404 NOT FOUND\r\n"
-					"Connection: close\r\n"
-					"Content-Length: 14\r\n"
-					"Content-Type: text/plain\r\n"
-					"\r\n"
-					"404 NOT FOUND\n";
-				uword responseLength = strlen(response);
-				socketSend("Server", clientSocket, responseLength, response);
+				if (!httpSend404Response("Server", clientSocket)) {
+					return 1;
+				}
 			}
-			httpBufferDiscardBytes(&buffer, cursor);
 		} else {
 //TODO send response stating the request was invalid, and close connection
-			StringSlice requestLine = {
-				buffer.data + requestLineBegin,
-				buffer.data + requestLineBegin + requestLineLength};
 			fprintf(
-				stderr, "[Server] Unknown HTML request: %.*s\n",
+				stderr, "[Server] Unknown HTML request: '%.*s'\n",
 				StringSlicePrintf(requestLine));
 			return 1;
 		}
+
+		httpBufferDiscardBytes(&buffer, header.charCount);
 	}
 
 	printf("[Server] Closing client socket.\n");
@@ -517,6 +475,79 @@ static int runServer() {
 	closesocket(listenSocket);
 
 	printf("[Server] Done.\n");
+	return 0;
+}
+
+static DWORD WINAPI runClient(void* param) {
+	int wsResult;
+
+	addrinfo addrHints = {
+		.ai_family = AF_UNSPEC,
+		.ai_socktype = SOCK_STREAM,
+		.ai_protocol = IPPROTO_TCP,
+	};
+	addrinfo* addr; //LEAK
+	wsResult = getaddrinfo(serverAddress, port, &addrHints, &addr);
+	if (wsResult != 0) {
+		fprintf(stderr, "[Client] getaddrinfo() failed: %d\n", wsResult);
+		return 1;
+	}
+
+	SOCKET sock = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
+	if (sock == INVALID_SOCKET) {
+		fprintf(stderr, "[Client] socket() failed: %d\n", WSAGetLastError());
+		return 1;
+	}
+
+	printf("[Client] Establishing connection to server...\n");
+
+	wsResult = connect(sock, addr->ai_addr, (int) addr->ai_addrlen);
+	if (wsResult == SOCKET_ERROR) {
+		fprintf(stderr, "[Client] connect() failed: %d\n", wsResult);
+		return 1;
+	}
+	freeaddrinfo(addr);
+	addr = NULL;
+
+	printf("[Client] Connected to server.\n");
+
+	const char* httpRequest =
+		"GET /index.html\r\n"
+		"Accept: text/html\r\n"
+		"Accept-Charset: utf-8\r\n"
+		"Accept-Encoding: gzip, deflate\r\n"
+		"\r\n";
+	uword stringLength = strlen(httpRequest);
+	if (!socketSend("Client", sock, stringLength, (char*) httpRequest)) {
+		return 1;
+	}
+	printf("[Client] Sent GET request to server.\n");
+
+	char* receivedChars[1024];
+	uword maxCharCount = ArrayCount(receivedChars);
+
+	HttpBuffer buffer;
+	httpBufferInit(&buffer, "Client", sock);
+
+	HttpHeader header;
+	if (!httpBufferReadHeader(&buffer, &header)) {
+		return 1;
+	}
+
+	printf(
+		"[Client] Received reponse from server:\n%.*s",
+		(int) header.charCount, header.chars);
+
+//TODO print response from server
+
+	if (shutdown(sock, SD_SEND) == SOCKET_ERROR) {
+		fprintf(stderr, "[Client] shutdown() failed: %d\n", WSAGetLastError());
+		return 1;
+	}
+
+	closesocket(sock);
+
+	printf("[Client] Done.\n");
 	return 0;
 }
 
