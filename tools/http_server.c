@@ -134,14 +134,14 @@ static b32 socketSend(const char* context, SOCKET socket, uword byteCount, const
 	return TRUE;
 }
 
-static b32 socketReceive(const char* context, SOCKET socket, uword byteCount, void* bytes, uword* bytesRead) {
-	*bytesRead = 0;
+static b32 socketReceive(const char* context, SOCKET socket, uword byteCount, void* bytes, uword* bytesReceived) {
+	*bytesReceived = 0;
 	int receivedLength = recv(socket, bytes, byteCount, 0);
 	if (receivedLength == SOCKET_ERROR) {
 		fprintf(stderr, "[%s] recv() failed: %d\n", context, WSAGetLastError());
 		return FALSE;
 	}
-	*bytesRead = receivedLength;
+	*bytesReceived = receivedLength;
 	return TRUE;
 }
 
@@ -159,14 +159,14 @@ const char* context, SOCKET socket, uword bufferCapacity, u8* buffer, uword* str
 			return FALSE;
 		}
 
-		uword bytesRead;
-		if (!socketReceive(context, socket, bufferCapacity, buffer + bufferLength, &bytesRead)) {
+		uword bytesReceived;
+		if (!socketReceive(context, socket, bufferCapacity, buffer + bufferLength, &bytesReceived)) {
 			return FALSE;
 		}
-		assert(bytesRead <= bufferCapacity);
-		bufferCapacity -= bytesRead;
+		assert(bytesReceived <= bufferCapacity);
+		bufferCapacity -= bytesReceived;
 
-		u64 nextLength = bufferLength + bytesRead;
+		u64 nextLength = bufferLength + bytesReceived;
 		for (u64 i = bufferLength; i < nextLength; ++i) {
 			if (buffer[i] == '\0') {
 				*stringLength = bufferLength;
@@ -198,6 +198,8 @@ static DWORD WINAPI runClient(void* param) {
 		return 1;
 	}
 
+	printf("[Client] Establishing connection to server...\n");
+
 	wsResult = connect(sock, addr->ai_addr, (int) addr->ai_addrlen);
 	if (wsResult == SOCKET_ERROR) {
 		fprintf(stderr, "[Client] connect() failed: %d\n", wsResult);
@@ -206,6 +208,8 @@ static DWORD WINAPI runClient(void* param) {
 	freeaddrinfo(addr);
 	addr = NULL;
 
+	printf("[Client] Connected to server.\n");
+
 	const char* httpRequest =
 		"GET /index.html\r\n"
 		"Accept: text/html\r\n"
@@ -213,7 +217,21 @@ static DWORD WINAPI runClient(void* param) {
 		"Accept-Encoding: gzip, deflate\r\n"
 		"\r\n";
 	uword stringLength = strlen(httpRequest);
-	socketSend("Client", sock, stringLength, (char*) httpRequest);
+	if (!socketSend("Client", sock, stringLength, (char*) httpRequest)) {
+		return 1;
+	}
+	printf("[Client] Sent GET request to server.\n");
+
+	char* receivedChars[1024];
+	uword maxCharCount = ArrayCount(receivedChars);
+
+	uword bytesReceived = 0;
+	if (!socketReceive("Client", sock, maxCharCount, receivedChars, &bytesReceived)) {
+		return 1;
+	}
+	printf("[Client] Received reponse from server.\n");
+
+//TODO print response from server
 
 	if (shutdown(sock, SD_SEND) == SOCKET_ERROR) {
 		fprintf(stderr, "[Client] shutdown() failed: %d\n", WSAGetLastError());
@@ -338,7 +356,7 @@ static b32 httpReadOption(HttpBuffer* buffer, uword* cursor, HttpOption* option)
 	return TRUE;
 }
 
-static DWORD WINAPI runServer(void* param) {
+static int runServer() {
 	int wsResult;
 
 	addrinfo addrHints = {
@@ -360,7 +378,7 @@ static DWORD WINAPI runServer(void* param) {
 		return 1;
 	}
 
-	printf("[Server] Listening for connection request.\n");
+	printf("[Server] Waiting for connection request...\n");
 
 	wsResult = bind(listenSocket, addr->ai_addr, (int) addr->ai_addrlen);
 	if (wsResult != 0) {
@@ -380,7 +398,7 @@ static DWORD WINAPI runServer(void* param) {
 		return 1;
 	}
 
-	printf("[Server] Connection to client established.\n");
+	printf("[Server] Connected to client.\n");
 
 //TODO need timeouts on waiting for data - is this built in to the socket somewhere?
 
@@ -512,23 +530,23 @@ int main() {
 
 //#define TEST_CLIENT
 
-	HANDLE threads[] = {
-		CreateThread(NULL, 0, runServer, NULL, 0, NULL),
 #ifdef TEST_CLIENT
-		CreateThread(NULL, 0, runClient, NULL, 0, NULL),
+	HANDLE clientThread = CreateThread(NULL, 0, runClient, NULL, 0, NULL);
 #endif
-	};
-	WaitForMultipleObjects(ArrayCount(threads), threads, TRUE, INFINITE);
-	int result = 0;
-	for (u32 i = 0; i < ArrayCount(threads); ++i) {
-		DWORD exitCode;
-		GetExitCodeThread(threads[i], &exitCode);
-		CloseHandle(threads[i]);
-		if (exitCode != 0)
-		{
-			result = 1;
-		}
+
+	int mainResult = runServer();
+
+#ifdef TEST_CLIENT
+	WaitForSingleObject(clientThread, INFINITE);
+	DWORD clientExitCode;
+	GetExitCodeThread(clientThread, &clientExitCode);
+	CloseHandle(clientThread);
+	if (clientExitCode != 0)
+	{
+		mainResult = 1;
 	}
+#endif
+
 	WSACleanup();
-	return result;
+	return mainResult;
 }
