@@ -551,7 +551,7 @@ static DWORD WINAPI runClient(void* param) {
 	return 0;
 }
 
-int main() {
+int main(int argc, char* argv[]) {
 	WSADATA wsaData;
 	int wsResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
 	if (wsResult != 0) {
@@ -559,24 +559,46 @@ int main() {
 		return 1;
 	}
 
-//#define TEST_CLIENT
+	b32 runTestClient = FALSE;
+	for (int i = 1; i < argc; ++i)
+	{
+		const char* arg = argv[i];
+		if (strcmp(arg, "--test-client") == 0)
+		{
+			runTestClient = TRUE;
+		} else
+		{
+			fprintf(stderr, "Unknown option '%s'\n", arg);
+			return 1;
+		}
+	}
 
-#ifdef TEST_CLIENT
-	HANDLE clientThread = CreateThread(NULL, 0, runClient, NULL, 0, NULL);
-#endif
+	HANDLE clientThread = NULL;
+	if (runTestClient)
+	{
+		printf("[Client] Starting test client...\n");
+		clientThread = CreateThread(NULL, 0, runClient, NULL, 0, NULL);
+		if (clientThread == NULL)
+		{
+			fprintf(stderr, "Failed to create test client thread\n");
+			return 1;
+		}
+	}
 
 	int mainResult = runServer();
 
-#ifdef TEST_CLIENT
-	WaitForSingleObject(clientThread, INFINITE);
-	DWORD clientExitCode;
-	GetExitCodeThread(clientThread, &clientExitCode);
-	CloseHandle(clientThread);
-	if (clientExitCode != 0)
+	if (runTestClient)
 	{
-		mainResult = 1;
+		assert(clientThread);
+		WaitForSingleObject(clientThread, INFINITE);
+		DWORD clientExitCode;
+		GetExitCodeThread(clientThread, &clientExitCode);
+		CloseHandle(clientThread);
+		if (clientExitCode != 0)
+		{
+			mainResult = 1;
+		}
 	}
-#endif
 
 	WSACleanup();
 	return mainResult;
