@@ -135,47 +135,24 @@ static b32 socketSend(const char* context, SOCKET socket, uword byteCount, const
 	return TRUE;
 }
 
-static b32 socketReceive(const char* context, SOCKET socket, uword byteCount, void* bytes, uword* bytesReceived) {
-	*bytesReceived = 0;
-	int receivedLength = recv(socket, bytes, byteCount, 0);
+static b32 socketReceive(
+const char* context, SOCKET socket, uword maxByteCount,
+void* bytes, uword* receivedByteCount, b32* connectionClosed) {
+	*receivedByteCount = 0;
+	*connectionClosed = TRUE;
+	int receivedLength = recv(socket, bytes, maxByteCount, 0);
 	if (receivedLength == SOCKET_ERROR) {
 		fprintf(stderr, "[%s] recv() failed: %d\n", context, WSAGetLastError());
 		return FALSE;
 	}
-	*bytesReceived = receivedLength;
+	*connectionClosed = (receivedLength == 0);
+	*receivedByteCount = receivedLength;
 	return TRUE;
 }
 
 static b32 socketSendCString(const char* context, SOCKET socket, const char* string) {
 	uword stringLength = strlen(string) + 1;
 	return socketSend(context, socket, stringLength, string);
-}
-
-static b32 socketReceiveCString(
-const char* context, SOCKET socket, uword bufferCapacity, u8* buffer, uword* stringLength) {
-	uword bufferLength = 0;
-	for (;;) {
-		if (bufferCapacity == 0) {
-			fprintf(stderr, "[%s] Buffer overflow on recv()\n", context);
-			return FALSE;
-		}
-
-		uword bytesReceived;
-		if (!socketReceive(context, socket, bufferCapacity, buffer + bufferLength, &bytesReceived)) {
-			return FALSE;
-		}
-		assert(bytesReceived <= bufferCapacity);
-		bufferCapacity -= bytesReceived;
-
-		u64 nextLength = bufferLength + bytesReceived;
-		for (u64 i = bufferLength; i < nextLength; ++i) {
-			if (buffer[i] == '\0') {
-				*stringLength = bufferLength;
-				return TRUE;
-			}
-		}
-		bufferLength = nextLength;
-	}
 }
 
 inline static void skipSpaces(const char** cursor, const char* end) {
@@ -200,7 +177,7 @@ typedef struct HttpOption {
 
 // Read the next line from a buffered HTTP header. If this line is the end of
 // the header (a blank line), this function returns false. Otherwise, it
-// returns true.
+// returns TRUE.
 static StringSlice httpHeaderNextLine(HttpHeader* header) {
 	const char* lineBegin = header->cursor;
 	const char* headerEnd = header->chars + header->charCount;
@@ -244,11 +221,15 @@ static HttpOption httpHeaderNextOption(HttpHeader* header) {
 }
 
 typedef struct HttpBuffer {
+	const char* name;
 	u8* data;
 	uword capacity;
 	uword size;
 	SOCKET socket;
-	const char* name;
+
+//TODO could use a bitset for these flags. Since they are mutually exclusive, they could also be an enum.
+	b32 error;
+	b32 connectionClosed;
 } HttpBuffer;
 
 static void httpBufferInit(HttpBuffer* buffer, const char* name, SOCKET socket) {
@@ -258,24 +239,22 @@ static void httpBufferInit(HttpBuffer* buffer, const char* name, SOCKET socket) 
 }
 
 static void httpBufferGrow(HttpBuffer* buffer) {
-	uword newCapacity = buffer->capacity == 0 ? 1 : buffer->capacity * 2;
+	uword newCapacity = (buffer->capacity == 0) ? 1024 : buffer->capacity * 2;
 	buffer->data = checkOutOfMemory(realloc(buffer->data, newCapacity));
 	buffer->capacity = newCapacity;
 }
 
-static b32 httpBufferReadBytes(HttpBuffer* buffer) {
-	uword remainingCapacity = buffer->capacity - buffer->size;
-	if (remainingCapacity == 0) {
+static void httpBufferReadBytes(HttpBuffer* buffer) {
+	if (buffer->capacity == buffer->size) {
 		httpBufferGrow(buffer);
 	}
-	remainingCapacity = buffer->capacity - buffer->size;
-	int receivedLength = recv(buffer->socket, buffer->data + buffer->size, remainingCapacity, 0);
-	if (receivedLength == SOCKET_ERROR) {
-		fprintf(stderr, "[%s] recv() failed: %d\n", buffer->name, WSAGetLastError());
-		return FALSE;
-	}
-	buffer->size += receivedLength;
-	return TRUE;
+	uword remainingCapacity = buffer->capacity - buffer->size;
+	u8* receivePointer = buffer->data + buffer->size;
+	uword receivedByteCount;
+	buffer->error |= !socketReceive(
+		buffer->name, buffer->socket, remainingCapacity, receivePointer,
+		&receivedByteCount, &buffer->connectionClosed);
+	buffer->size += receivedByteCount;
 }
 
 static void httpBufferDiscardBytes(HttpBuffer* buffer, uword byteCount) {
@@ -290,7 +269,7 @@ static void httpBufferDiscardBytes(HttpBuffer* buffer, uword byteCount) {
 // we do not find the end of the header before reaching this limit, log an
 // error message, send an error response to the client, and close the
 // connection to the client.
-static b32 httpBufferReadHeader(HttpBuffer* buffer, HttpHeader* header) {
+static void httpBufferReadHeader(HttpBuffer* buffer, HttpHeader* header) {
 	uword cursor = 0;
 	for (;;) {
 		while (cursor < buffer->size) {
@@ -308,12 +287,13 @@ static b32 httpBufferReadHeader(HttpBuffer* buffer, HttpHeader* header) {
 				header->charCount = cursor;
 				header->chars = buffer->data;
 				header->cursor = buffer->data;
-				return TRUE;
+				return;
 			}
 			++cursor;
 		}
-		if (!httpBufferReadBytes(buffer)) {
-			return FALSE;
+		httpBufferReadBytes(buffer);
+		if (buffer->error | buffer->connectionClosed) {
+			return;
 		}
 	}
 }
@@ -396,12 +376,17 @@ static int runServer() {
 	HttpBuffer buffer;
 	httpBufferInit(&buffer, "Server", clientSocket);
 
-//TODO browsers do not tell us to shut down the connection, so we get stuck in this loop
 	for (;;) {
 		HttpHeader header;
-		if (!httpBufferReadHeader(&buffer, &header)) {
+		httpBufferReadHeader(&buffer, &header);
+		if (buffer.error) {
 			return 1;
 		}
+		if (buffer.connectionClosed) {
+			printf("[Server] Client closed connection.\n");
+			break;
+		}
+
 		StringSlice requestLine = httpHeaderNextLine(&header);
 		uword requestLineLength = stringSliceLength(requestLine);
 
@@ -464,11 +449,16 @@ static int runServer() {
 		httpBufferDiscardBytes(&buffer, header.charCount);
 	}
 
-	printf("[Server] Closing client socket.\n");
-	if (shutdown(clientSocket, SD_SEND) == SOCKET_ERROR) {
-		fprintf(stderr, "[Server] shutdown() failed: %d\n", WSAGetLastError());
-		return 1;
+	// shut down the client if the connection has not yet been closed
+	if (!buffer.connectionClosed) {
+		printf("[Server] Shutting down client.\n");
+		if (shutdown(clientSocket, SD_SEND) == SOCKET_ERROR) {
+			fprintf(stderr, "[Server] shutdown() failed: %d\n", WSAGetLastError());
+			return 1;
+		}
 	}
+
+	printf("[Server] Closing client socket.\n");
 	closesocket(clientSocket);
 
 	printf("[Server] Closing listen socket.\n");
@@ -523,14 +513,16 @@ static DWORD WINAPI runClient(void* param) {
 	}
 	printf("[Client] Sent GET request to server.\n");
 
-	char* receivedChars[1024];
-	uword maxCharCount = ArrayCount(receivedChars);
-
 	HttpBuffer buffer;
 	httpBufferInit(&buffer, "Client", sock);
 
 	HttpHeader header;
-	if (!httpBufferReadHeader(&buffer, &header)) {
+	httpBufferReadHeader(&buffer, &header);
+	if (buffer.error) {
+		return 1;
+	}
+	if (buffer.connectionClosed) {
+		printf("[Client] Server closed connection before it sent response.\n");
 		return 1;
 	}
 
@@ -538,7 +530,7 @@ static DWORD WINAPI runClient(void* param) {
 		"[Client] Received reponse from server:\n%.*s",
 		(int) header.charCount, header.chars);
 
-//TODO print response from server
+//TODO log response from server
 
 	if (shutdown(sock, SD_SEND) == SOCKET_ERROR) {
 		fprintf(stderr, "[Client] shutdown() failed: %d\n", WSAGetLastError());
@@ -560,26 +552,21 @@ int main(int argc, char* argv[]) {
 	}
 
 	b32 runTestClient = FALSE;
-	for (int i = 1; i < argc; ++i)
-	{
+	for (int i = 1; i < argc; ++i) {
 		const char* arg = argv[i];
-		if (strcmp(arg, "--test-client") == 0)
-		{
+		if (strcmp(arg, "--test-client") == 0) {
 			runTestClient = TRUE;
-		} else
-		{
+		} else {
 			fprintf(stderr, "Unknown option '%s'\n", arg);
 			return 1;
 		}
 	}
 
 	HANDLE clientThread = NULL;
-	if (runTestClient)
-	{
+	if (runTestClient) {
 		printf("[Client] Starting test client...\n");
 		clientThread = CreateThread(NULL, 0, runClient, NULL, 0, NULL);
-		if (clientThread == NULL)
-		{
+		if (clientThread == NULL) {
 			fprintf(stderr, "Failed to create test client thread\n");
 			return 1;
 		}
@@ -587,15 +574,13 @@ int main(int argc, char* argv[]) {
 
 	int mainResult = runServer();
 
-	if (runTestClient)
-	{
+	if (runTestClient) {
 		assert(clientThread);
 		WaitForSingleObject(clientThread, INFINITE);
 		DWORD clientExitCode;
 		GetExitCodeThread(clientThread, &clientExitCode);
 		CloseHandle(clientThread);
-		if (clientExitCode != 0)
-		{
+		if (clientExitCode != 0) {
 			mainResult = 1;
 		}
 	}
