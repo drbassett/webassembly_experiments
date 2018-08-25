@@ -164,6 +164,11 @@ inline static void skipSpaces(const char** cursor, const char* end) {
 	}
 }
 
+void httpServerExitError() {
+//TODO maybe attempt to automatically reboot the server?
+	ExitProcess(1);
+}
+
 typedef struct HttpHeader {
 	uword charCount;
 	const char* chars;
@@ -232,9 +237,8 @@ typedef struct HttpBuffer {
 	b32 connectionClosed;
 } HttpBuffer;
 
-static void httpBufferInit(HttpBuffer* buffer, const char* name, SOCKET socket) {
+static void httpBufferInit(HttpBuffer* buffer, const char* name) {
 	ClearValueToZero(*buffer);
-	buffer->socket = socket;
 	buffer->name = name;
 }
 
@@ -298,6 +302,19 @@ static void httpBufferReadHeader(HttpBuffer* buffer, HttpHeader* header) {
 	}
 }
 
+inline static void httpBufferReset(HttpBuffer* buffer) {
+	buffer->size = 0;
+	buffer->socket = INVALID_SOCKET;
+	buffer->error = FALSE;
+	buffer->connectionClosed = FALSE;
+}
+
+inline static void httpBufferDestroy(HttpBuffer* buffer) {
+	free(buffer->data);
+	ClearValueToZero(*buffer);
+	buffer->socket = INVALID_SOCKET;
+}
+
 static b32 httpSendOkResponse(const char* context, SOCKET socket, uword contentLength, const void* content) {
 	char header[1024]; //TODO prune the size of this header
 	int headerLength = sprintf(
@@ -326,63 +343,20 @@ static b32 httpSend404Response(const char* context, SOCKET socket) {
 	return socketSend(context, socket, responseLength, response);
 }
 
-static int runServer() {
-	int wsResult;
-
-	addrinfo addrHints = {
-		.ai_flags = AI_PASSIVE,
-		.ai_family = AF_INET,
-		.ai_socktype = SOCK_STREAM,
-		.ai_protocol = IPPROTO_TCP,
-	};
-	addrinfo* addr;
-	wsResult = getaddrinfo(NULL, port, &addrHints, &addr);
-	if (wsResult != 0) {
-		fprintf(stderr, "[Server] getaddrinfo() failed: %d\n", wsResult);
-		return 1;
-	}
-
-	SOCKET listenSocket = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
-	if (listenSocket == INVALID_SOCKET) {
-		fprintf(stderr, "[Server] socket() failed: %d\n", WSAGetLastError());
-		return 1;
-	}
-
-	printf("[Server] Waiting for connection request...\n");
-
-	wsResult = bind(listenSocket, addr->ai_addr, (int) addr->ai_addrlen);
-	if (wsResult != 0) {
-		fprintf(stderr, "[Server] bind() failed: %d\n", wsResult);
-		return 1;
-	}
-	freeaddrinfo(addr);
-
-	if (listen(listenSocket, SOMAXCONN) == SOCKET_ERROR) {
-		fprintf(stderr, "[Server] listen() failed: %d\n", WSAGetLastError());
-		return 1;
-	}
-
-	SOCKET clientSocket = accept(listenSocket, NULL, NULL);
-	if (clientSocket == INVALID_SOCKET) {
-		fprintf(stderr, "[Server] accept() failed: %d\n", WSAGetLastError());
-		return 1;
-	}
-
-	printf("[Server] Connected to client.\n");
-
+static void serviceClient(HttpBuffer* buffer, SOCKET clientSocket) {
 //TODO need timeouts on waiting for data - is this built in to the socket somewhere?
 
-//TODO this buffer could grow indefinitely if given a bad packet stream. Add some protections against this.
-	HttpBuffer buffer;
-	httpBufferInit(&buffer, "Server", clientSocket);
-
+	httpBufferReset(buffer);
+//TODO it feels wrong to use the HTTP buffer's socket as the client socket
+	buffer->socket = clientSocket;
+	
 	for (;;) {
 		HttpHeader header;
-		httpBufferReadHeader(&buffer, &header);
-		if (buffer.error) {
-			return 1;
+		httpBufferReadHeader(buffer, &header);
+		if (buffer->error) {
+			return;
 		}
-		if (buffer.connectionClosed) {
+		if (buffer->connectionClosed) {
 			printf("[Server] Client closed connection.\n");
 			break;
 		}
@@ -428,14 +402,14 @@ static int runServer() {
 			if (indexFileRequested) {
 				printf("[Server] Sending index.html to client...\n");
 				if (!httpSendOkResponse("SERVER", clientSocket, strlen(index_html), index_html)) {
-					return 1;
+					return;
 				}
 			} else {
 				printf(
 					"[Server] Sending 404 response for request 'GET %.*s'...\n",
 					StringSlicePrintf(url));
 				if (!httpSend404Response("Server", clientSocket)) {
-					return 1;
+					return;
 				}
 			}
 		} else {
@@ -443,26 +417,85 @@ static int runServer() {
 			fprintf(
 				stderr, "[Server] Unknown HTML request: '%.*s'\n",
 				StringSlicePrintf(requestLine));
-			return 1;
+			return;
 		}
 
-		httpBufferDiscardBytes(&buffer, header.charCount);
+		httpBufferDiscardBytes(buffer, header.charCount);
 	}
 
 	// shut down the client if the connection has not yet been closed
-	if (!buffer.connectionClosed) {
+	if (!buffer->connectionClosed) {
 		printf("[Server] Shutting down client.\n");
 		if (shutdown(clientSocket, SD_SEND) == SOCKET_ERROR) {
 			fprintf(stderr, "[Server] shutdown() failed: %d\n", WSAGetLastError());
-			return 1;
+			return;
 		}
 	}
 
 	printf("[Server] Closing client socket.\n");
-	closesocket(clientSocket);
+	if (closesocket(clientSocket) == SOCKET_ERROR) {
+		fprintf(stderr, "[Server] closesocket() for client socket failed: %d\n", WSAGetLastError());
+	}
+}
+
+static int runServer() {
+	int wsResult;
+
+	addrinfo addrHints = {
+		.ai_flags = AI_PASSIVE,
+		.ai_family = AF_INET,
+		.ai_socktype = SOCK_STREAM,
+		.ai_protocol = IPPROTO_TCP,
+	};
+	addrinfo* addr;
+	wsResult = getaddrinfo(NULL, port, &addrHints, &addr);
+	if (wsResult != 0) {
+		fprintf(stderr, "[Server] getaddrinfo() failed: %d\n", wsResult);
+		return 1;
+	}
+
+	SOCKET listenSocket = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
+	if (listenSocket == INVALID_SOCKET) {
+		fprintf(stderr, "[Server] socket() failed: %d\n", WSAGetLastError());
+		return 1;
+	}
+
+	printf("[Server] Waiting for connection request...\n");
+
+	wsResult = bind(listenSocket, addr->ai_addr, (int) addr->ai_addrlen);
+	if (wsResult != 0) {
+		fprintf(stderr, "[Server] bind() failed: %d\n", wsResult);
+		return 1;
+	}
+	freeaddrinfo(addr);
+
+	if (listen(listenSocket, SOMAXCONN) == SOCKET_ERROR) {
+		fprintf(stderr, "[Server] listen() failed: %d\n", WSAGetLastError());
+		return 1;
+	}
+
+//TODO this buffer could grow indefinitely if given a bad packet stream. Add some protections against this.
+	HttpBuffer httpBuffer;
+	httpBufferInit(&httpBuffer, "Server");
+
+//TODO provide some means of shutting down the server
+	for (;;)
+	{
+		SOCKET clientSocket = accept(listenSocket, NULL, NULL);
+		if (clientSocket == INVALID_SOCKET) {
+			fprintf(stderr, "[Server] accept() failed: %d\n", WSAGetLastError());
+			continue;
+		}
+		printf("[Server] Connected to client.\n");
+		serviceClient(&httpBuffer, clientSocket);
+	}
+
+	httpBufferDestroy(&httpBuffer);
 
 	printf("[Server] Closing listen socket.\n");
-	closesocket(listenSocket);
+	if (closesocket(listenSocket) == SOCKET_ERROR) {
+		fprintf(stderr, "[Server] closesocket() for listen socket failed: %d\n", WSAGetLastError());
+	}
 
 	printf("[Server] Done.\n");
 	return 0;
@@ -514,7 +547,8 @@ static DWORD WINAPI runClient(void* param) {
 	printf("[Client] Sent GET request to server.\n");
 
 	HttpBuffer buffer;
-	httpBufferInit(&buffer, "Client", sock);
+	httpBufferInit(&buffer, "Client");
+	buffer.socket = sock;
 
 	HttpHeader header;
 	httpBufferReadHeader(&buffer, &header);
@@ -537,7 +571,9 @@ static DWORD WINAPI runClient(void* param) {
 		return 1;
 	}
 
-	closesocket(sock);
+	if (closesocket(sock) == SOCKET_ERROR) {
+		fprintf(stderr, "[Client] closesocket() failed: %d\n", WSAGetLastError());
+	}
 
 	printf("[Client] Done.\n");
 	return 0;
